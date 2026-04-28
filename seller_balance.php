@@ -557,6 +557,11 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
                )";
         }
 
+$paymentStatusSql = '';
+        if (_bv_sb_column_exists($pdo, 'orders', 'payment_status')) {
+            $paymentStatusSql = " AND o.payment_status IN ('paid','succeeded')";
+        }
+
         $sql = "SELECT e.seller_id,
                        e.reference_id AS order_item_id,
                        e.currency,
@@ -564,26 +569,31 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
                        oi.order_id,
                        o.order_code,
                        COALESCE(e.amount, 0) AS gross_amount,
-                       COALESCE(f.amount, 0) AS fee_amount,
-                       COALESCE(e.amount, 0) - COALESCE(f.amount, 0) AS net_amount
+                       COALESCE(f.pending_fee_amount, 0) AS fee_amount,
+                       COALESCE(e.amount, 0) - COALESCE(f.pending_fee_amount, 0) AS net_amount 
                 FROM seller_ledger e
                 JOIN order_items oi ON oi.id = e.reference_id AND oi.seller_id = e.seller_id
                 JOIN orders o ON o.id = oi.order_id
-               JOIN seller_ledger f
-                  ON f.seller_id = e.seller_id
-                 AND f.reference_type = 'order_item'
-                 AND f.reference_id = e.reference_id
-                 AND f.type = 'platform_fee'
-                AND f.balance_type = 'pending'
-                 AND f.direction = 'debit'				 
-                 AND f.idempotency_key = CONCAT('order_paid_platform_fee:', oi.order_id, ':', oi.id)
+                LEFT JOIN (
+                    SELECT seller_id,
+                           reference_id,
+                           SUM(amount) AS pending_fee_amount
+                    FROM seller_ledger
+                    WHERE type = 'platform_fee'
+                      AND balance_type = 'pending'
+                      AND direction = 'debit'
+                      AND reference_type = 'order_item'
+                    GROUP BY seller_id, reference_id
+                ) f
+                   ON f.seller_id = e.seller_id
+                  AND f.reference_id = e.reference_id
                 WHERE e.type = 'earning'
                   AND e.balance_type = 'pending'
                   AND e.direction = 'credit'
                   AND e.reference_type = 'order_item'
                   AND e.created_at <= DATE_SUB(NOW(), INTERVAL :days DAY)
-                  AND o.status NOT IN ('cancelled','refunded')
-                  AND COALESCE(o.payment_status, '') <> 'refunded'
+                  AND o.status IN ('confirmed','paid','processing','shipped','completed')
+                  $paymentStatusSql
                   AND NOT EXISTS (
                       SELECT 1 FROM seller_ledger pr
                       WHERE pr.seller_id = e.seller_id
@@ -625,21 +635,46 @@ if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
 }
 
 if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
-    function bv_seller_balance_release_pending_for_seller(int $sellerId, string $currency = 'USD'): int
+    function bv_seller_balance_release_pending_for_seller(int $sellerId, string $currency = 'USD'): array
     {
         if ($sellerId <= 0) {
-            return 0;
+            return [
+                'released_count' => 0,
+                'released_amount' => 0.0,
+                'skipped_count' => 0,
+                'errors' => ['Invalid seller_id'],
+            ];
         }
-        $released = 0;
+ 
+        $result = [
+            'released_count' => 0,
+            'released_amount' => 0.0,
+            'skipped_count' => 0,
+            'errors' => [],
+        ];
         foreach (bv_seller_balance_find_releasable_ledger_rows($sellerId) as $row) {
             if ($currency !== '' && strcasecmp((string)$row['currency'], $currency) !== 0) {
+				                $result['skipped_count']++;
                 continue;
             }
-            if (bv_seller_balance_release_pending_for_row($row)) {
-                $released++;
+            $amount = round((float)($row['net_amount'] ?? 0), 4);
+            if ($amount <= 0) {
+                $result['skipped_count']++;
+                continue;
+            }
+            try {
+                if (bv_seller_balance_release_pending_for_row($row)) {
+                    $result['released_count']++;
+                    $result['released_amount'] = round(((float)$result['released_amount']) + $amount, 4);
+                } else {
+                    $result['skipped_count']++;
+                }
+            } catch (Throwable $e) {
+                $result['skipped_count']++;
+                $result['errors'][] = $e->getMessage();
             }
         }
-        return $released;
+        return $result;
     }
 }
 
