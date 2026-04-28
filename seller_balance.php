@@ -538,11 +538,11 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
     {
         $pdo = bv_seller_balance_pdo();
         $days = max(0, (int)bv_seller_balance_get_setting('payout_clearance_days', '3'));
-        $params = [':days' => $days];
+        $params = [$days];
         $sellerSql = '';
         if ($sellerId !== null && $sellerId > 0) {
-            $sellerSql = ' AND e.seller_id = :seller_id';
-            $params[':seller_id'] = $sellerId;
+          $sellerSql = ' AND e.seller_id = ?';
+            $params[] = $sellerId; 
         }
 
         $activeRefundSql = '';
@@ -557,9 +557,9 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
                )";
         }
 
-$paymentStatusSql = '';
+        $paymentStatusSql = '';
         if (_bv_sb_column_exists($pdo, 'orders', 'payment_status')) {
-            $paymentStatusSql = " AND o.payment_status IN ('paid','succeeded')";
+            $paymentStatusSql = " AND o.payment_status IN ('paid','succeeded','complete','completed')";
         }
 
         $sql = "SELECT e.seller_id,
@@ -591,15 +591,17 @@ $paymentStatusSql = '';
                   AND e.balance_type = 'pending'
                   AND e.direction = 'credit'
                   AND e.reference_type = 'order_item'
-                  AND e.created_at <= DATE_SUB(NOW(), INTERVAL :days DAY)
+                   AND e.amount > 0
+                  AND e.created_at <= DATE_SUB(NOW(), INTERVAL ? DAY)
                   AND o.status IN ('confirmed','paid','processing','shipped','completed')
                   $paymentStatusSql
                   AND NOT EXISTS (
-                      SELECT 1 FROM seller_ledger pr
-                      WHERE pr.seller_id = e.seller_id
-                        AND pr.type = 'pending_release'
-                        AND pr.reference_type = 'order_item'
-                        AND pr.reference_id = e.reference_id
+                      SELECT 1 FROM seller_ledger prd
+                      WHERE prd.idempotency_key = CONCAT('pending_release_debit:', e.seller_id, ':', e.reference_id)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM seller_ledger prc
+                      WHERE prc.idempotency_key = CONCAT('pending_release_credit:', e.seller_id, ':', e.reference_id)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM seller_ledger rh
@@ -697,7 +699,7 @@ if (!function_exists('bv_seller_balance_release_pending_for_row')) {
             $pdo->beginTransaction();
             if (_bv_sb_ledger_exists($pdo, $debitKey) || _bv_sb_ledger_exists($pdo, $creditKey)) {
                 $pdo->rollBack();
-                return true;
+                return false;
             }
 
             $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
@@ -752,10 +754,10 @@ if (!function_exists('bv_seller_balance_release_pending_for_row')) {
 
             $pdo->prepare(
                 'UPDATE seller_balances
-                 SET pending_balance = pending_balance - :amt,
-                     available_balance = available_balance + :amt
-                 WHERE seller_id = :sid'
-            )->execute([':amt' => $releaseAmt, ':sid' => $sellerId]);
+                 SET pending_balance = pending_balance - ?,
+                     available_balance = available_balance + ?
+                 WHERE seller_id = ?'
+            )->execute([$releaseAmt, $releaseAmt, $sellerId]);
 
             $pdo->commit();
             return true;
