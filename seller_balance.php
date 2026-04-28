@@ -9,7 +9,7 @@ declare(strict_types=1);
  *
  * Ledger types:
  *   earning            – net earning added to pending
- *   platform_fee       – informational: commission platform kept (balance_type='none')
+ *   platform_fee       – pending debit of platform commission
  *   pending_release    – pending → available (2 entries: debit pending + credit available)
  *   refund_hold        – amount held back pending refund decision
  *   refund_deduction   – final deduction after refund processed
@@ -403,18 +403,23 @@ if (!function_exists('bv_seller_balance_process_order_paid')) {
             $feeKey = 'order_paid_platform_fee:' . $orderId . ':' . $itemId;
             $legacyKey = 'order_paid:' . $orderId . ':' . $itemId;
 
-            if (_bv_sb_ledger_exists($pdo, $earningKey) || _bv_sb_ledger_exists($pdo, $legacyKey)) {
-                $processed[] = $itemId;
-                continue;
-            }
-
             $platformFee = round($gross * $commissionRate, 4);
             $netEarning = round($gross - $platformFee, 4);
 
             try {
                 $pdo->beginTransaction();
 
-                if (_bv_sb_ledger_exists($pdo, $earningKey) || _bv_sb_ledger_exists($pdo, $legacyKey)) {
+                $legacyExists = _bv_sb_ledger_exists($pdo, $legacyKey);
+                $earningExists = _bv_sb_ledger_exists($pdo, $earningKey);
+                $feeExists = _bv_sb_ledger_exists($pdo, $feeKey);
+
+                if ($legacyExists) {
+                    $pdo->rollBack();
+                    $processed[] = $itemId;
+                    continue;
+                }
+
+                if ($earningExists && $feeExists) {
                     $pdo->rollBack();
                     $processed[] = $itemId;
                     continue;
@@ -431,71 +436,86 @@ if (!function_exists('bv_seller_balance_process_order_paid')) {
                 $balance = $balRow->fetch(PDO::FETCH_ASSOC);
 
                 $pendingBefore = round((float)($balance['pending_balance'] ?? 0), 4);
-                $pendingAfterEarning = round($pendingBefore + $gross, 4);
-                $pendingAfterFee = round($pendingAfterEarning - $platformFee, 4);
+                 $pendingCursor = $pendingBefore;
+                $pendingDelta = 0.0;
+                $grossDelta = 0.0;
+                $feeDelta = 0.0;
 
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id'       => $sellerId,
-                    'type'            => 'earning',
-                    'balance_type'    => 'pending',
-                    'direction'       => 'credit',
-                    'amount'          => $gross,
-                    'currency'        => $currency,
-                    'balance_before'  => $pendingBefore,
-                    'balance_after'   => $pendingAfterEarning,
-                    'reference_type'  => 'order_item',
-                    'reference_id'    => $itemId,
-                    'idempotency_key' => $earningKey,
-                    'note'            => 'Order #' . $orderId . ' item #' . $itemId . ': ' . ($item['item_title'] ?? ''),
-                    'meta_json'       => [
-                        'order_id'        => $orderId,
-                        'order_code'      => $item['order_code'] ?? '',
-                        'order_item_id'   => $itemId,
-                        'gross'           => $gross,
-                        'commission_rate' => $commissionRate,
-                        'platform_fee'    => $platformFee,
-                        'net_earning'     => $netEarning,
-                    ],
-                    'created_by_type' => 'system',
-                ]);
-
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id'       => $sellerId,
-                    'type'            => 'platform_fee',
-                    'balance_type'    => 'pending',
-                    'direction'       => 'debit',
-                    'amount'          => $platformFee,
-                    'currency'        => $currency,
-                    'balance_before'  => $pendingAfterEarning,
-                    'balance_after'   => $pendingAfterFee,
-                    'reference_type'  => 'order_item',
-                    'reference_id'    => $itemId,
-                    'idempotency_key' => $feeKey,
-                    'note'            => 'Platform fee ' . round($commissionRate * 100, 2) . '% on order #' . $orderId,
-                    'meta_json'       => [
-                        'order_id'        => $orderId,
-                        'order_item_id'   => $itemId,
-                        'gross'           => $gross,
-                        'commission_rate' => $commissionRate,
-                        'platform_fee'    => $platformFee,
-                    ],
-                    'created_by_type' => 'system',
-                ]);
-
-                $pdo->prepare(
-                    'UPDATE seller_balances
-                     SET pending_balance = pending_balance + :gross - :fee,
-                         total_earned_gross = total_earned_gross + :gross,
-                         total_platform_fee = total_platform_fee + :fee,
-                         currency = :currency
-                     WHERE seller_id = :sid'
-                )->execute([
-                    ':gross'    => $gross,
-                    ':fee'      => $platformFee,
-                    ':currency' => $currency,
-                    ':sid'      => $sellerId,
-                ]);
-
+                 if (!$earningExists) {
+                    $pendingAfterEarning = round($pendingCursor + $gross, 4);
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'earning',
+                        'balance_type'    => 'pending',
+                        'direction'       => 'credit',
+                        'amount'          => $gross,
+                        'currency'        => $currency,
+                        'balance_before'  => $pendingCursor,
+                        'balance_after'   => $pendingAfterEarning,
+                        'reference_type'  => 'order_item',
+                        'reference_id'    => $itemId,
+                        'idempotency_key' => $earningKey,
+                        'note'            => 'Order #' . $orderId . ' item #' . $itemId . ': ' . ($item['item_title'] ?? ''),
+                        'meta_json'       => [
+                            'order_id'        => $orderId,
+                            'order_code'      => $item['order_code'] ?? '',
+                            'order_item_id'   => $itemId,
+                            'gross'           => $gross,
+                            'commission_rate' => $commissionRate,
+                            'platform_fee'    => $platformFee,
+                            'net_earning'     => $netEarning,
+                        ],
+                        'created_by_type' => 'system',
+                    ]);
+                    $pendingCursor = $pendingAfterEarning;
+                    $pendingDelta = round($pendingDelta + $gross, 4);
+                    $grossDelta = $gross;
+                }
+               if (!$feeExists) {
+                    $pendingAfterFee = round($pendingCursor - $platformFee, 4);
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'platform_fee',
+                        'balance_type'    => 'pending',
+                        'direction'       => 'debit',
+                        'amount'          => $platformFee,
+                        'currency'        => $currency,
+                        'balance_before'  => $pendingCursor,
+                        'balance_after'   => $pendingAfterFee,
+                        'reference_type'  => 'order_item',
+                        'reference_id'    => $itemId,
+                        'idempotency_key' => $feeKey,
+                        'note'            => 'Platform fee ' . round($commissionRate * 100, 2) . '% on order #' . $orderId,
+                        'meta_json'       => [
+                            'order_id'        => $orderId,
+                            'order_item_id'   => $itemId,
+                            'gross'           => $gross,
+                            'commission_rate' => $commissionRate,
+                            'platform_fee'    => $platformFee,
+                        ],
+                        'created_by_type' => 'system',
+                    ]);
+                    $pendingCursor = $pendingAfterFee;
+                    $pendingDelta = round($pendingDelta - $platformFee, 4);
+                    $feeDelta = $platformFee;
+                }
+				
+                if ($pendingDelta !== 0.0 || $grossDelta !== 0.0 || $feeDelta !== 0.0) {
+                    $pdo->prepare(
+                        'UPDATE seller_balances
+                         SET pending_balance = pending_balance + :pending_delta,
+                             total_earned_gross = total_earned_gross + :gross_delta,
+                             total_platform_fee = total_platform_fee + :fee_delta,
+                             currency = :currency
+                         WHERE seller_id = :sid'
+                    )->execute([
+                        ':pending_delta' => $pendingDelta,
+                        ':gross_delta' => $grossDelta,
+                        ':fee_delta' => $feeDelta,
+                        ':currency' => $currency,
+                        ':sid' => $sellerId,
+                    ]);
+                }
                 $pdo->commit();
                 $processed[] = $itemId;
             } catch (Throwable $e) {
@@ -549,11 +569,13 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
                 FROM seller_ledger e
                 JOIN order_items oi ON oi.id = e.reference_id AND oi.seller_id = e.seller_id
                 JOIN orders o ON o.id = oi.order_id
-                LEFT JOIN seller_ledger f
+               JOIN seller_ledger f
                   ON f.seller_id = e.seller_id
                  AND f.reference_type = 'order_item'
                  AND f.reference_id = e.reference_id
                  AND f.type = 'platform_fee'
+                AND f.balance_type = 'pending'
+                 AND f.direction = 'debit'				 
                  AND f.idempotency_key = CONCAT('order_paid_platform_fee:', oi.order_id, ':', oi.id)
                 WHERE e.type = 'earning'
                   AND e.balance_type = 'pending'
@@ -1258,7 +1280,7 @@ if (!function_exists('_bv_sb_refund_seller_exposures')) {
              LEFT JOIN seller_ledger e
                ON e.seller_id = oi.seller_id AND e.type = 'earning'
               AND e.reference_type = 'order_item' AND e.reference_id = oi.id
-             LEFT JOIN seller_ledger f
+              JOIN seller_ledger f
                ON f.seller_id = oi.seller_id AND f.type = 'platform_fee'
               AND f.reference_type = 'order_item' AND f.reference_id = oi.id
              WHERE r.id = :rid"
