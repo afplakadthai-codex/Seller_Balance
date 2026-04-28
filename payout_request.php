@@ -53,9 +53,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $bankAcctNum  = trim((string)($_POST['bank_account_number'] ?? ''));
     $bankAcctName = trim((string)($_POST['bank_account_name'] ?? ''));
     $promptpay    = trim((string)($_POST['promptpay_number'] ?? ''));
+	$wiseEmail    = trim((string)($_POST['wise_email'] ?? ''));	
     $sellerNote   = trim((string)($_POST['seller_note'] ?? ''));
 
-    $old = compact('amount','payoutMethod','bankName','bankAcctNum','bankAcctName','promptpay','sellerNote');
+    $old = compact('amount','payoutMethod','bankName','bankAcctNum','bankAcctName','promptpay','wiseEmail','sellerNote');
 
     // Validate amount
     if (!is_numeric($amount) || (float)$amount <= 0) {
@@ -94,9 +95,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
         if ($payoutMethod === 'promptpay') {
-            if ($promptpay === '') {
-                $errors['promptpay_number'] = 'PromptPay number is required.';
+            $promptpayDigits = preg_replace('/\D+/', '', $promptpay);
+            if (!in_array(strlen($promptpayDigits), [10, 13], true)) {
+                $errors['promptpay_number'] = 'PromptPay number must contain exactly 10 or 13 digits.'; 
             }
+           $promptpay = $promptpayDigits;
+        }
+        if ($payoutMethod === 'wise' && $sellerNote === '' && $wiseEmail === '') {
+            $errors['seller_note'] = 'Wise payout requires note or Wise email.';			
         }
     }
 
@@ -114,7 +120,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'bank_account_name'    => $bankAcctName,
                 'promptpay_number'     => $promptpay,
                 'payout_method'        => $payoutMethod,
+                'wise_email'           => $wiseEmail,				
                 'seller_note'          => $sellerNote,
+                'currency'             => $currency,				
             ]);
             // Rotate CSRF token after successful submit
             unset($_SESSION['_bvsb_csrf_' . $csrfAction]);
@@ -220,6 +228,10 @@ a{color:#d8b56b;text-decoration:none}
   <div class="card">
     <form method="POST" action="">
       <input type="hidden" name="csrf_token" value="<?= bv_sb_e($csrfToken) ?>">
+	  
+      <div class="alert" style="background:rgba(216,181,107,.1);border:1px solid rgba(216,181,107,.28);color:#f0d7a3;">
+        Once submitted, this amount will be locked until admin processes the payout.
+      </div>
 
       <!-- Amount -->
       <div class="field">
@@ -289,6 +301,19 @@ a{color:#d8b56b;text-decoration:none}
           <?php if (!empty($errors['bank_account_name'])): ?><div class="error-msg"><?= bv_sb_e($errors['bank_account_name']) ?></div><?php endif; ?>
         </div>
       </div>
+	  
+     <!-- Wise panel -->
+      <div class="method-panel<?= ($old['payoutMethod'] ?? '') === 'wise' ? ' active' : '' ?>" id="panel-wise">
+        <div class="field" style="margin-bottom:0">
+          <label for="wise_email">Wise Email (optional, recommended)</label>
+          <input class="input"
+            type="email" id="wise_email" name="wise_email"
+            value="<?= bv_sb_e($old['wiseEmail'] ?? '') ?>"
+            placeholder="you@example.com">
+          <div class="help">Provide Wise email or include details in note below.</div>
+        </div>
+      </div>
+	  
 
       <!-- PromptPay panel -->
       <div class="method-panel<?= ($old['payoutMethod'] ?? '') === 'promptpay' ? ' active' : '' ?>" id="panel-promptpay">
@@ -309,9 +334,12 @@ a{color:#d8b56b;text-decoration:none}
         <label for="seller_note">Note to Admin <span style="color:#6b8070;font-weight:400;">(optional)</span></label>
         <textarea class="textarea" id="seller_note" name="seller_note"
           placeholder="Additional payout instructions, Wise email, LINE ID for confirmation, etc."><?= bv_sb_e($old['sellerNote'] ?? '') ?></textarea>
+        <?php if (!empty($errors['seller_note'])): ?>
+          <div class="error-msg"><?= bv_sb_e($errors['seller_note']) ?></div>
+        <?php endif; ?>		  
       </div>
 
-      <button type="submit" class="btn btn-gold">Submit Payout Request</button>
+      <button type="submit" class="btn btn-gold" <?= ($available <= 0 || $openPayout) ? "disabled" : "" ?>>Submit Payout Request</button>
       <div style="margin-top:10px;text-align:center;">
         <a href="balance.php" style="font-size:13px;color:#8ea29a;">Cancel</a>
       </div>
